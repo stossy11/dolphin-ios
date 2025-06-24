@@ -31,6 +31,9 @@
 
 #ifdef IPHONEOS
 #include "Common/JITMemoryTracker.h"
+#include <mach/mach.h>
+#include <mach/vm_map.h>
+#include <unordered_map>
 #endif
 
 namespace Common
@@ -42,36 +45,168 @@ namespace Common
 static JITMemoryTracker g_jit_memory_tracker;
 #endif
 
+#ifdef IPHONEOS
+// iOS-specific dual mapping structure
+struct IOSJITRegion {
+    void* rw_ptr;     // Read-write mapping
+    void* rx_ptr;     // Read-execute mapping
+    size_t size;
+    vm_address_t rw_addr;
+    vm_address_t rx_addr;
+};
+
+static std::unordered_map<void*, IOSJITRegion> g_ios_jit_regions;
+
 void* AllocateExecutableMemory(size_t size)
 {
-#if defined(_WIN32)
-  void* ptr = VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-#else
-  int map_flags = MAP_ANON | MAP_PRIVATE;
-#if defined(__APPLE__) && !defined(IPHONEOS)
-  map_flags |= MAP_JIT;
-#endif
+    // Create initial RW mapping
+    void* rw_ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (rw_ptr == MAP_FAILED) {
+        PanicAlertFmt("Failed to allocate RW memory for iOS JIT: {}", LastStrerrorString());
+        return nullptr;
+    }
 
-  int map_prot = PROT_READ | PROT_EXEC;
-#ifndef IPHONEOS
-  // The default protection is r-x on non-iOS platforms.
-  map_prot |= PROT_WRITE;
-#endif
+    vm_address_t rw_addr = vm_address_t(reinterpret_cast<uintptr_t>(rw_ptr));
+    vm_address_t rx_addr = 0;
+    vm_prot_t cur_prot = 0;
+    vm_prot_t max_prot = 0;
 
-  void* ptr = mmap(nullptr, size, map_prot, map_flags, -1, 0);
-  if (ptr == MAP_FAILED)
-    ptr = nullptr;
-#endif
+    // Create RX mapping via vm_remap
+    kern_return_t remap_result = vm_remap(
+        mach_task_self(),
+        &rx_addr,
+        vm_size_t(size),
+        0,
+        VM_FLAGS_ANYWHERE,
+        mach_task_self(),
+        rw_addr,
+        0,
+        &cur_prot,
+        &max_prot,
+        VM_INHERIT_NONE
+    );
 
-  if (ptr == nullptr)
-    PanicAlertFmt("Failed to allocate executable memory: {}", LastStrerrorString());
+    if (remap_result != KERN_SUCCESS) {
+        munmap(rw_ptr, size);
+        PanicAlertFmt("Failed to remap RX region for iOS JIT: {}", remap_result);
+        return nullptr;
+    }
 
-#ifdef IPHONEOS
-  g_jit_memory_tracker.RegisterJITRegion(ptr, size);
-#endif
+    // Set RX protection
+    kern_return_t protect_rx = vm_protect(
+        mach_task_self(),
+        rx_addr,
+        vm_size_t(size),
+        0,
+        VM_PROT_READ | VM_PROT_EXECUTE
+    );
 
-  return ptr;
+    if (protect_rx != KERN_SUCCESS) {
+        munmap(rw_ptr, size);
+        vm_deallocate(mach_task_self(), rx_addr, size);
+        PanicAlertFmt("Failed to set RX protection for iOS JIT: {}", protect_rx);
+        return nullptr;
+    }
+
+    // Set RW protection (should already be set, but ensure it)
+    kern_return_t protect_rw = vm_protect(
+        mach_task_self(),
+        rw_addr,
+        vm_size_t(size),
+        0,
+        VM_PROT_READ | VM_PROT_WRITE
+    );
+
+    if (protect_rw != KERN_SUCCESS) {
+        munmap(rw_ptr, size);
+        vm_deallocate(mach_task_self(), rx_addr, size);
+        PanicAlertFmt("Failed to set RW protection for iOS JIT: {}", protect_rw);
+        return nullptr;
+    }
+
+    void* rx_ptr = reinterpret_cast<void*>(rx_addr);
+    
+    // Store the mapping info
+    IOSJITRegion region = {
+        .rw_ptr = rw_ptr,
+        .rx_ptr = rx_ptr,
+        .size = size,
+        .rw_addr = rw_addr,
+        .rx_addr = rx_addr
+    };
+    
+    g_ios_jit_regions[rx_ptr] = region;
+    
+    // Register with the JIT memory tracker using the RX pointer
+    g_jit_memory_tracker.RegisterJITRegion(rx_ptr, size);
+
+    return rx_ptr; // Return the executable pointer
 }
+
+void JITPageWriteEnableExecuteDisable(void* ptr)
+{
+    auto it = g_ios_jit_regions.find(ptr);
+    if (it != g_ios_jit_regions.end()) {
+        // For iOS, we don't need to change protections since we have separate RW/RX mappings
+        // The JIT memory tracker will handle switching between the pointers
+        g_jit_memory_tracker.JITRegionWriteEnableExecuteDisable(ptr);
+    }
+}
+
+void JITPageWriteDisableExecuteEnable(void* ptr)
+{
+    auto it = g_ios_jit_regions.find(ptr);
+    if (it != g_ios_jit_regions.end()) {
+        g_jit_memory_tracker.JITRegionWriteDisableExecuteEnable(ptr);
+    }
+}
+
+bool FreeMemoryPages(void* ptr, size_t size)
+{
+    if (ptr) {
+        auto it = g_ios_jit_regions.find(ptr);
+        if (it != g_ios_jit_regions.end()) {
+            IOSJITRegion& region = it->second;
+            
+            // Unregister from JIT tracker first
+            g_jit_memory_tracker.UnregisterJITRegion(ptr);
+            
+            // Free both mappings
+            if (munmap(region.rw_ptr, region.size) != 0) {
+                PanicAlertFmt("FreeMemoryPages failed to unmap RW region!\nmunmap: {}", LastStrerrorString());
+                return false;
+            }
+            
+            if (vm_deallocate(mach_task_self(), region.rx_addr, region.size) != KERN_SUCCESS) {
+                PanicAlertFmt("FreeMemoryPages failed to deallocate RX region!");
+                return false;
+            }
+            
+            g_ios_jit_regions.erase(it);
+            return true;
+        }
+        
+        // Fallback to regular munmap if not found in our regions
+        if (munmap(ptr, size) != 0) {
+            PanicAlertFmt("FreeMemoryPages failed!\nmunmap: {}", LastStrerrorString());
+            return false;
+        }
+    }
+    return true;
+}
+
+// Helper function to get the RW pointer for a given RX pointer
+void* GetWritablePointerForExecutable(void* rx_ptr)
+{
+    auto it = g_ios_jit_regions.find(rx_ptr);
+    if (it != g_ios_jit_regions.end()) {
+        return it->second.rw_ptr;
+    }
+    return nullptr;
+}
+
+#endif // IPHONEOS
+
 #ifndef IPHONEOS
 // This function is used to provide a counter for the JITPageWrite*Execute*
 // functions to enable nesting. The static variable is wrapped in a a function
@@ -147,15 +282,15 @@ void JITPageWriteDisableExecuteEnable()
 #endif
 }
 #else
-void JITPageWriteEnableExecuteDisable(void* ptr)
-{
-  g_jit_memory_tracker.JITRegionWriteEnableExecuteDisable(ptr);
-}
+// void JITPageWriteEnableExecuteDisable(void* ptr)
+// {
+  // g_jit_memory_tracker.JITRegionWriteEnableExecuteDisable(ptr);
+// }
 
-void JITPageWriteDisableExecuteEnable(void* ptr)
-{
-  g_jit_memory_tracker.JITRegionWriteDisableExecuteEnable(ptr);
-}
+// void JITPageWriteDisableExecuteEnable(void* ptr)
+// {
+ //  g_jit_memory_tracker.JITRegionWriteDisableExecuteEnable(ptr);
+// }
 #endif
 
 void* AllocateMemoryPages(size_t size)
@@ -191,7 +326,7 @@ void* AllocateAlignedMemory(size_t size, size_t alignment)
   return ptr;
 }
 
-bool FreeMemoryPages(void* ptr, size_t size)
+bool FreeMemoryPages2(void* ptr, size_t size)
 {
   if (ptr)
   {
